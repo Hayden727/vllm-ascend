@@ -558,165 +558,118 @@ def fused_experts(
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """
-    Fused experts with top-k routing.
-
-    Args:
-        hidden_states: Hidden states of shape (num_tokens, hidden_size).
-        w1: Expert weights1 of shape (num_experts, intermediate_size * 2, hidden_size).
-        w2: Expert weights2 of shape (num_experts, hidden_size, intermediate_size).
-        topk_weights: Routing weights of shape (num_tokens, top_k).
-        topk_ids: Selected expert IDs of shape (num_tokens, top_k).
-        top_k: Number of experts to select.
-        expert_map: Expert mapping of shape (num_experts,).
-
-    Returns:
-        hidden_states: Hidden states after routing.
+    Fused experts with top-k routing and multi-stream parallel computation.
     """
-    """
-    # Check constraints.
-    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
-    assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-    assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
-    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
-    """
-    # if torch.distributed.get_rank() == 0:
-    #     print(w1.shape)
-    #     print(hidden_states.shape)
-
     original_shape = hidden_states.shape
-    # assert len(original_shape) == 2
-
     num_tokens = hidden_states.shape[:-1].numel()
     num_experts = w1.shape[0]
     dtype = hidden_states.dtype
     device = hidden_states.device
-    # assert dtype in [torch.float32, torch.float16, torch.bfloat16
-    #                  ], "Only float32, float16, and bfloat16 are supported"
 
     if apply_router_weight_on_input:
-        assert (topk_weights.dim() == 2
-                ), "`topk_weights` should be in shape (num_tokens, topk)"
+        assert (topk_weights.dim() == 2), "`topk_weights` should be in shape (num_tokens, topk)"
         _, topk = topk_weights.shape
-        assert (
-            topk == 1
-        ), "Only support topk=1 when `apply_router_weight_on_input` is True"
+        assert (topk == 1), "Only support topk=1 when `apply_router_weight_on_input` is True"
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
 
-    if expert_map is not None:
-        # Generate token indices and flatten
-        token_indices = (torch.arange(num_tokens,
-                                      device=device,
-                                      dtype=torch.int64).unsqueeze(1).expand(
-                                          -1, top_k).reshape(-1))
+    # 使用多流处理专家路由
+    with npu_stream_switch("moe_primary", 0):
+        if expert_map is not None:
+            # 专家映射和排序逻辑
+            token_indices = (torch.arange(num_tokens, device=device, dtype=torch.int64)
+                           .unsqueeze(1).expand(-1, top_k).reshape(-1))
+            weights_flat = topk_weights.view(-1)
+            experts_flat = topk_ids.view(-1)
+            local_experts_flat = expert_map[experts_flat]
+            
+            mask = local_experts_flat != -1
+            filtered_weights = torch.where(mask, weights_flat, 
+                                         torch.zeros_like(weights_flat)).to(dtype)
+            filtered_experts = torch.where(mask, local_experts_flat,
+                                         torch.full_like(local_experts_flat, num_experts)).to(topk_ids.dtype)
+            
+            sort_indices = torch.argsort(filtered_experts.view(torch.float32))
+            sorted_token_indices = token_indices[sort_indices]
+            sorted_weights = filtered_weights[sort_indices]
+            
+            token_counts = torch.zeros(num_experts + 1, device=device, dtype=torch.int64)
+            ones = torch.ones_like(filtered_experts, dtype=torch.int64)
+            token_counts.scatter_add_(0, filtered_experts.to(torch.int64), ones)
+            token_counts = token_counts[:num_experts]
+            expert_tokens = torch.cumsum(token_counts, dim=0, dtype=torch.int64)
+            
+            sorted_hidden_states = hidden_states[sorted_token_indices]
+        else:
+            row_idx_len = num_tokens * top_k
+            row_idx = (torch.arange(0, row_idx_len, dtype=torch.int32, device=device)
+                      .view(top_k, -1).permute(1, 0).contiguous())
+            sorted_hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
+                hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens)
+            
+            expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
+                expanded_expert_idx, num_experts).to(torch.int64)
 
-        # Flatten token-to-expert mappings and map to local experts
-        weights_flat = topk_weights.view(-1)
-        experts_flat = topk_ids.view(-1)
-        local_experts_flat = expert_map[experts_flat]
-
-        # Filter valid token-expert pairs
-        mask = local_experts_flat != -1
-        filtered_weights = torch.where(
-            mask, weights_flat, torch.zeros_like(weights_flat)).to(dtype)
-        filtered_experts = torch.where(
-            mask, local_experts_flat,
-            torch.full_like(local_experts_flat,
-                            num_experts)).to(topk_ids.dtype)
-
-        # Sort by local expert IDs
-        sort_indices = torch.argsort(filtered_experts.view(torch.float32))
-        sorted_token_indices = token_indices[sort_indices]
-        sorted_weights = filtered_weights[sort_indices]
-
-        # Compute token counts with minlength of num_experts
-        # This is equivalent to but faster than:
-        # >>> token_counts = torch.bincount(filtered_experts, minlength=num_experts)[:-1]
-        token_counts = torch.zeros(num_experts + 1,
-                                   device=device,
-                                   dtype=torch.int64)
-        ones = torch.ones_like(filtered_experts, dtype=torch.int64)
-        token_counts.scatter_add_(0, filtered_experts.to(torch.int64), ones)
-        token_counts = token_counts[:num_experts]
-        expert_tokens = torch.cumsum(token_counts, dim=0, dtype=torch.int64)
-
-        # Rearrange hidden_states
-        sorted_hidden_states = hidden_states[sorted_token_indices]
-    else:
-        row_idx_len = num_tokens * top_k
-        row_idx = (torch.arange(0,
-                                row_idx_len,
-                                dtype=torch.int32,
-                                device=device).view(top_k, -1).permute(
-                                    1, 0).contiguous())
-        sorted_hidden_states, expanded_row_idx, expanded_expert_idx = torch_npu.npu_moe_init_routing(
-            hidden_states,
-            row_idx=row_idx,
-            expert_idx=topk_ids,
-            active_num=num_tokens)
-
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts)
-        expert_tokens = expert_tokens.to(torch.int64)
-
-    w1 = w1.transpose(1, 2)
-    gate_up_out_list = torch_npu.npu_grouped_matmul(
-        x=[sorted_hidden_states],
-        weight=[w1],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-    )
-
-    # TODO: Remove this in the future.
-    gate_up_out = torch.cat(gate_up_out_list, dim=0)
-    gate_up_out = torch_npu.npu_swiglu(gate_up_out)
-
-    w2 = w2.transpose(1, 2)
-    down_out_list = torch_npu.npu_grouped_matmul(
-        x=[gate_up_out],
-        weight=[w2],
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-    )
-
-    down_out_list = torch.cat(down_out_list, dim=0)
-
-    if expert_map is not None:
-        weighted_down_out = down_out_list * sorted_weights.unsqueeze(1)
-
-        final_hidden_states = torch.zeros(*original_shape,
-                                          device=hidden_states.device,
-                                          dtype=dtype)
-
-        # TODO: npu_grouped_matmul output random values at [num_valid_tokens:, ...]
-        # This created multiple NaN and index_add_ will mix them up which harms accuracy
-        # remove this mask and filter after it being fixed
-        num_valid_tokens = mask.sum()
-        valid_token_mask = torch.arange(
-            0, sorted_token_indices.shape[0],
-            device=device).unsqueeze(1) < num_valid_tokens
-        valid_output = torch.where(
-            valid_token_mask, weighted_down_out,
-            torch.zeros_like(weighted_down_out)).to(dtype)
-        final_hidden_states.index_add_(0, sorted_token_indices, valid_output)
-    else:
-        scales = torch.ones_like(
-            topk_weights) if apply_router_weight_on_input else topk_weights
-        # TODO: Reorder device memory 2 times here, replace the current
-        # implementation here when suitable operators become available.
-        final_hidden_states = torch_npu.npu_moe_finalize_routing(
-            down_out_list,
-            skip1=None,
-            skip2=None,
-            bias=None,
-            scales=scales,
-            expanded_src_to_dst_row=expanded_row_idx,
-            export_for_source_row=topk_ids,
+    # 使用多流并行处理专家计算
+    with npu_stream_switch("moe_secondary", 0):
+        # 等待路由完成
+        npu_wait_tensor(sorted_hidden_states)
+        
+        # Cube 模块计算 - 第一次矩阵乘法
+        w1 = w1.transpose(1, 2)
+        gate_up_out_list = torch_npu.npu_grouped_matmul(
+            x=[sorted_hidden_states],
+            weight=[w1],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
         )
+        
+        # Vector 模块计算 - SwiGLU 激活
+        gate_up_out = torch.cat(gate_up_out_list, dim=0)
+        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        
+        # 等待激活完成
+        npu_wait_tensor(gate_up_out)
+        
+        # Cube 模块计算 - 第二次矩阵乘法
+        w2 = w2.transpose(1, 2)
+        down_out_list = torch_npu.npu_grouped_matmul(
+            x=[gate_up_out],
+            weight=[w2],
+            split_item=2,
+            group_list_type=0,
+            group_type=0,
+            group_list=expert_tokens,
+        )
+        down_out_list = torch.cat(down_out_list, dim=0)
+
+    # 使用多流处理结果合并
+    with npu_stream_switch("moe_primary", 0):
+        # 等待计算完成
+        npu_wait_tensor(down_out_list)
+        
+        if expert_map is not None:
+            weighted_down_out = down_out_list * sorted_weights.unsqueeze(1)
+            final_hidden_states = torch.zeros(*original_shape, device=device, dtype=dtype)
+            
+            num_valid_tokens = mask.sum()
+            valid_token_mask = torch.arange(0, sorted_token_indices.shape[0], 
+                                          device=device).unsqueeze(1) < num_valid_tokens
+            valid_output = torch.where(valid_token_mask, weighted_down_out,
+                                     torch.zeros_like(weighted_down_out)).to(dtype)
+            final_hidden_states.index_add_(0, sorted_token_indices, valid_output)
+        else:
+            scales = torch.ones_like(topk_weights) if apply_router_weight_on_input else topk_weights
+            final_hidden_states = torch_npu.npu_moe_finalize_routing(
+                down_out_list,
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=scales,
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=topk_ids,
+            )
 
     return final_hidden_states
 
